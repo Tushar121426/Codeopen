@@ -4,86 +4,363 @@
 #include <DallasTemperature.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
+#include <EEPROM.h>
 
-// ===== WiFi Config =====
+// ===== WiFi Configuration =====
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 
-// ===== Sensor Config =====
-#define ONE_WIRE_BUS 4     // DS18B20 pin
-#define DHTPIN 5           // DHT sensor pin
-#define DHTTYPE DHT22      // or DHT11
+// ===== Sensor Configuration =====
+#define ONE_WIRE_BUS 4     // DS18B20 data pin
+#define DHTPIN 5           // DHT22 data pin
+#define DHTTYPE DHT22      // DHT sensor type
 
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature ds18b20(&oneWire);
 DHT dht(DHTPIN, DHTTYPE);
 
-// ===== Relay Config =====
+// ===== Relay Configuration =====
 #define RELAY_PIN 2
 bool relayState = false;
+
+// ===== Control Thresholds =====
+float tempThreshold = 30.0;
+float humThreshold = 70.0;
+bool autoControl = false;
 
 // ===== Web Server =====
 WebServer server(80);
 
+// ===== Data Storage =====
+struct SensorReading {
+  unsigned long timestamp;
+  float ds18b20_temp;
+  float dht_temp;
+  float dht_hum;
+  bool relay;
+};
+
+const int MAX_READINGS = 200;
+SensorReading readings[MAX_READINGS];
+int readingIndex = 0;
+int totalReadings = 0;
+
+// ===== EEPROM Addresses =====
+#define EEPROM_SIZE 64
+#define TEMP_THRESHOLD_ADDR 0
+#define HUM_THRESHOLD_ADDR 4
+#define AUTO_CONTROL_ADDR 8
+
+// ===== CORS Headers =====
+void setCORSHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ===== Save/Load Settings =====
+void saveSettings() {
+  EEPROM.writeFloat(TEMP_THRESHOLD_ADDR, tempThreshold);
+  EEPROM.writeFloat(HUM_THRESHOLD_ADDR, humThreshold);
+  EEPROM.writeBool(AUTO_CONTROL_ADDR, autoControl);
+  EEPROM.commit();
+}
+
+void loadSettings() {
+  tempThreshold = EEPROM.readFloat(TEMP_THRESHOLD_ADDR);
+  humThreshold = EEPROM.readFloat(HUM_THRESHOLD_ADDR);
+  autoControl = EEPROM.readBool(AUTO_CONTROL_ADDR);
+  
+  // Set defaults if EEPROM is empty
+  if (isnan(tempThreshold) || tempThreshold < 0 || tempThreshold > 100) {
+    tempThreshold = 30.0;
+  }
+  if (isnan(humThreshold) || humThreshold < 0 || humThreshold > 100) {
+    humThreshold = 70.0;
+  }
+}
+
+// ===== Store Sensor Reading =====
+void storeSensorReading(float ds18Temp, float dhtTemp, float dhtHum) {
+  readings[readingIndex] = {
+    millis(),
+    ds18Temp,
+    dhtTemp,
+    dhtHum,
+    relayState
+  };
+  
+  readingIndex = (readingIndex + 1) % MAX_READINGS;
+  if (totalReadings < MAX_READINGS) {
+    totalReadings++;
+  }
+}
+
+// ===== Auto Control Logic =====
+void checkAutoControl(float ds18Temp, float dhtHum) {
+  if (!autoControl) return;
+  
+  bool shouldActivate = (ds18Temp >= tempThreshold) || (dhtHum >= humThreshold);
+  
+  if (shouldActivate && !relayState) {
+    digitalWrite(RELAY_PIN, HIGH);
+    relayState = true;
+    Serial.println("Auto Control: Relay ON (Threshold exceeded)");
+  } else if (!shouldActivate && relayState) {
+    digitalWrite(RELAY_PIN, LOW);
+    relayState = false;
+    Serial.println("Auto Control: Relay OFF (Below threshold)");
+  }
+}
+
 // ===== API: /api/data =====
 void handleData() {
+  setCORSHeaders();
+  
+  // Read sensors
   ds18b20.requestTemperatures();
-  float ds18b20Temp = ds18b20.getTempCByIndex(0);
+  float ds18Temp = ds18b20.getTempCByIndex(0);
   float dhtTemp = dht.readTemperature();
   float dhtHum = dht.readHumidity();
-
-  StaticJsonDocument<200> doc;
-  doc["ds18b20_temp"] = ds18b20Temp;
+  
+  // Handle sensor errors
+  if (ds18Temp == DEVICE_DISCONNECTED_C) ds18Temp = -999;
+  if (isnan(dhtTemp)) dhtTemp = -999;
+  if (isnan(dhtHum)) dhtHum = -999;
+  
+  // Store reading
+  storeSensorReading(ds18Temp, dhtTemp, dhtHum);
+  
+  // Check auto control
+  if (ds18Temp != -999 && dhtHum != -999) {
+    checkAutoControl(ds18Temp, dhtHum);
+  }
+  
+  // Create response
+  StaticJsonDocument<300> doc;
+  doc["timestamp"] = millis();
+  doc["ds18b20_temp"] = ds18Temp;
   doc["dht_temp"] = dhtTemp;
   doc["dht_hum"] = dhtHum;
   doc["relay"] = relayState ? "ON" : "OFF";
+  doc["auto_control"] = autoControl;
+  doc["temp_threshold"] = tempThreshold;
+  doc["hum_threshold"] = humThreshold;
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+  
+  // Debug output
+  Serial.printf("Data: DS18B20=%.1f°C, DHT=%.1f°C/%.1f%%, Relay=%s\n", 
+                ds18Temp, dhtTemp, dhtHum, relayState ? "ON" : "OFF");
+}
 
+// ===== API: /api/relay/on =====
+void handleRelayOn() {
+  setCORSHeaders();
+  digitalWrite(RELAY_PIN, HIGH);
+  relayState = true;
+  Serial.println("Manual: Relay ON");
+  server.send(200, "application/json", "{\"relay\":\"ON\",\"status\":\"success\"}");
+}
+
+// ===== API: /api/relay/off =====
+void handleRelayOff() {
+  setCORSHeaders();
+  digitalWrite(RELAY_PIN, LOW);
+  relayState = false;
+  Serial.println("Manual: Relay OFF");
+  server.send(200, "application/json", "{\"relay\":\"OFF\",\"status\":\"success\"}");
+}
+
+// ===== API: /api/thresholds =====
+void handleThresholds() {
+  setCORSHeaders();
+  
+  if (server.method() == HTTP_POST) {
+    String body = server.arg("plain");
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, body);
+    
+    if (error) {
+      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+      return;
+    }
+    
+    if (doc.containsKey("temp")) tempThreshold = doc["temp"];
+    if (doc.containsKey("hum")) humThreshold = doc["hum"];
+    if (doc.containsKey("auto")) autoControl = doc["auto"];
+    
+    saveSettings();
+    Serial.printf("Thresholds updated: Temp=%.1f°C, Hum=%.1f%%, Auto=%s\n", 
+                  tempThreshold, humThreshold, autoControl ? "ON" : "OFF");
+    
+    server.send(200, "application/json", "{\"status\":\"saved\"}");
+  } else {
+    StaticJsonDocument<200> doc;
+    doc["temp"] = tempThreshold;
+    doc["hum"] = humThreshold;
+    doc["auto"] = autoControl;
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
+  }
+}
+
+// ===== API: /api/stored =====
+void handleStored() {
+  setCORSHeaders();
+  
+  DynamicJsonDocument doc(16384);
+  JsonArray array = doc.to<JsonArray>();
+  
+  // Return readings in chronological order
+  for (int i = 0; i < totalReadings; i++) {
+    int idx = (readingIndex - totalReadings + i + MAX_READINGS) % MAX_READINGS;
+    JsonObject reading = array.createNestedObject();
+    reading["timestamp"] = readings[idx].timestamp;
+    reading["ds18b20"] = readings[idx].ds18b20_temp;
+    reading["dhtTemp"] = readings[idx].dht_temp;
+    reading["dhtHum"] = readings[idx].dht_hum;
+    reading["relay"] = readings[idx].relay;
+  }
+  
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+  
+  Serial.printf("Sent %d stored readings\n", totalReadings);
+}
+
+// ===== API: /api/export =====
+void handleExport() {
+  setCORSHeaders();
+  
+  String csv = "timestamp,ds18b20_temp,dht_temp,dht_hum,relay\n";
+  
+  for (int i = 0; i < totalReadings; i++) {
+    int idx = (readingIndex - totalReadings + i + MAX_READINGS) % MAX_READINGS;
+    csv += String(readings[idx].timestamp) + ",";
+    csv += String(readings[idx].ds18b20_temp, 2) + ",";
+    csv += String(readings[idx].dht_temp, 2) + ",";
+    csv += String(readings[idx].dht_hum, 2) + ",";
+    csv += (readings[idx].relay ? "ON" : "OFF") + "\n";
+  }
+  
+  server.sendHeader("Content-Disposition", "attachment; filename=sensor_data.csv");
+  server.send(200, "text/csv", csv);
+  
+  Serial.println("CSV export completed");
+}
+
+// ===== API: /api/status =====
+void handleStatus() {
+  setCORSHeaders();
+  
+  StaticJsonDocument<400> doc;
+  doc["wifi_ssid"] = WiFi.SSID();
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["ip_address"] = WiFi.localIP().toString();
+  doc["uptime"] = millis();
+  doc["free_heap"] = ESP.getFreeHeap();
+  doc["total_readings"] = totalReadings;
+  doc["relay_state"] = relayState;
+  doc["auto_control"] = autoControl;
+  doc["temp_threshold"] = tempThreshold;
+  doc["hum_threshold"] = humThreshold;
+  
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
 }
 
-// ===== API: /api/relay/on =====
-void handleRelayOn() {
-  digitalWrite(RELAY_PIN, HIGH);
-  relayState = true;
-  server.send(200, "application/json", "{\"relay\":\"ON\"}");
-}
-
-// ===== API: /api/relay/off =====
-void handleRelayOff() {
-  digitalWrite(RELAY_PIN, LOW);
-  relayState = false;
-  server.send(200, "application/json", "{\"relay\":\"OFF\"}");
+// ===== Handle OPTIONS for CORS =====
+void handleOptions() {
+  setCORSHeaders();
+  server.send(200, "text/plain", "");
 }
 
 // ===== Setup =====
 void setup() {
   Serial.begin(115200);
-
+  Serial.println("\n=== Smart Textile Monitor Starting ===");
+  
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+  loadSettings();
+  
+  // Initialize pins
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
-
+  
+  // Initialize sensors
   dht.begin();
   ds18b20.begin();
-
+  
+  Serial.printf("Found %d DS18B20 sensors\n", ds18b20.getDeviceCount());
+  
+  // Connect to WiFi
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
+    attempts++;
   }
-  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
-
-  // Routes
-  server.on("/api/data", handleData);
-  server.on("/api/relay/on", handleRelayOn);
-  server.on("/api/relay/off", handleRelayOff);
-
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Signal Strength: %d dBm\n", WiFi.RSSI());
+  } else {
+    Serial.println("\nWiFi Connection Failed!");
+    return;
+  }
+  
+  // Setup web server routes
+  server.on("/api/data", HTTP_GET, handleData);
+  server.on("/api/relay/on", HTTP_GET, handleRelayOn);
+  server.on("/api/relay/off", HTTP_GET, handleRelayOff);
+  server.on("/api/thresholds", HTTP_GET, handleThresholds);
+  server.on("/api/thresholds", HTTP_POST, handleThresholds);
+  server.on("/api/stored", HTTP_GET, handleStored);
+  server.on("/api/export", HTTP_GET, handleExport);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  
+  // Handle CORS preflight requests
+  server.onNotFound([]() {
+    if (server.method() == HTTP_OPTIONS) {
+      handleOptions();
+    } else {
+      setCORSHeaders();
+      server.send(404, "application/json", "{\"error\":\"Endpoint not found\"}");
+    }
+  });
+  
   server.begin();
+  Serial.println("HTTP Server started!");
+  Serial.printf("Loaded settings: Temp=%.1f°C, Hum=%.1f%%, Auto=%s\n", 
+                tempThreshold, humThreshold, autoControl ? "ON" : "OFF");
+  Serial.println("=== Setup Complete ===\n");
 }
 
-// ===== Loop =====
+// ===== Main Loop =====
 void loop() {
   server.handleClient();
+  
+  // Watchdog - restart if WiFi disconnected for too long
+  static unsigned long lastWiFiCheck = 0;
+  if (millis() - lastWiFiCheck > 30000) { // Check every 30 seconds
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected, restarting...");
+      ESP.restart();
+    }
+    lastWiFiCheck = millis();
+  }
+  
+  delay(10); // Small delay to prevent watchdog issues
 }
